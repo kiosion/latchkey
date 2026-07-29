@@ -1,0 +1,11 @@
+[package]
+name = "latchkey"
+version = "0.1.0"
+edition = "2024"
+description = "CLI for NSCCN wCopy-family 125 kHz / 13.56 MHz RFID readers (USB 2518:6018)"
+license = "Apache-2.0"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hidapi = "2"
+ratatui = "0.30.2"
