@@ -1,18 +1,20 @@
 # wCopy Smart Reader host protocol
 
-Recovered by static analysis of the vendor's Windows binary
-(`wCopy_2024010501.exe`, sha256
-`5dc1ef2d5e31422c2d6103ddac763490898a37ade00c5888463c84d7de9ff650`, PE32 x86
-MFC, built 2024-01-05) without execution.
+Recovered by static analysis of the vendor's Windows binary without execution.
+
+    wCopy_2024010501.zip  sha256 5dc1ef2d5e31422c2d6103ddac763490898a37ade00c5888463c84d7de9ff650
+    wCopy_2024010501.exe  sha256 33b7ee8b70b5322a2db0bd3b0b92b8bab2f8328c06b215dac2fc58cdbc962dfd
+
+PE32 x86 MFC, built 2024-01-05, 6435840 bytes.
 
 **Confirmed**: reproduced on hardware.
 **Recovered**: read from the disassembly and implemented, untested.
-**Inferred**: a reading the disassembly doesn't definitively settle.
+**Inferred**: a reading the disassembly does not settle.
 
 Confirmed here means one reader (USB `2518:6018`, `wCopy NSR109-HIDIC V806N`),
 one tag family (EM4100 fobs, T5577 blanks), one carrier (125 kHz). Enough to
 trust the framing, the `0x65` read, and the `0x66` code `0x13` write against
-blocks 0-2. Not enough to confirm anything for sure.
+blocks 0-2. Treat everything outside that as untested.
 
 ## Device
 
@@ -50,9 +52,9 @@ rejects.
 
     checksum = (~sum(frame[1 .. payload_len+4])) & 0xff
 
-Same checksum both directions. The device answers `seq + 1`; why the vendor's
-sequence global steps by 2. Max payload 58 bytes. Replies carry no report-ID
-byte, and every offset shifts down by one inbound.
+Same checksum both directions. The device answers `seq + 1`, which is why the
+vendor's sequence global steps by 2. Max payload 58 bytes. Replies carry no
+report-ID byte, and every offset shifts down by one inbound.
 
     tx  00 01 0d 00 00 ff 00 00 00 02 d4 02 1a fe
     rx  02 0e 01 00 d5 03 32 01 06 07 90 00 46 fd
@@ -77,9 +79,9 @@ function and `p2` is its argument. `p1 = 0x00` is PN533 passthrough with `data`
 starting at the `0xD4` host-to-controller TFI, documented in the NXP PN533
 manual. The 125 kHz side is separate silicon behind vendor functions.
 
-A one-byte payload is a status. `fd` rejects the command (read as "bad length or
-parameters", since almost every `p1` answers it to a zero-length body), `00`
-means in-range with nothing to report. Longer payloads are data, optionally
+A one-byte payload is a status. `fd` rejects the command, which reads as "bad
+length or parameters" since almost every `p1` answers it to a zero-length body.
+`00` means in-range with nothing to report. Longer payloads are data, optionally
 ending in `90 xx`.
 
 ## Command surface
@@ -99,15 +101,16 @@ enumerates the set exhaustively and yields 42 wrappers.
 | 65 | `p2 = 08` | `05` + 5 | 125 kHz ID read |
 | 66 | 18 codes | var | 125 kHz block and raw family |
 | 6a | `01` | 7 bytes | 13.56 MHz detect |
-| 6b | `30`, `31` | `63 00` | unknown, rejected by this reader |
+| 6b | `30`, `31` | 16 or 32 bytes | rejected by this reader with `63 00` |
 | 68 | `00` | `wCopy NSR109-HIDIC V806N` | model string |
 | 69 | `00` | `T37350466633` | serial string |
 | 80 | `00 01 11 12 14 19 21 22` | var | reader-level |
 | 82 | `00 04 05 07` | var | reader configuration |
 
 `p1 = 0x62` is a control command whose result the vendor discards. Both exit
-paths of `0x40de60` do `xor eax, eax`; it checks only for LEN 8 and reply byte 4
-being `0x90`. Not a read despite a 7-byte payload the shape of one.
+paths of `0x40de60` do `xor eax, eax`, and it checks only for LEN 8 with reply
+byte 4 as `0x90`. That is the two-byte payload `90 00`. An empty pad answers
+seven zero bytes instead, which is why this looks like a read and is not one.
 
 Six `ins` bytes answer with `p1 = p2 = 00`, exactly the ISO 7816 and PC/SC
 contactless-storage-card instructions. All return `63 00` ("no card selected")
@@ -122,19 +125,39 @@ except `ca`, which returns an all-zero UID plus `90 00`:
 `p1 = 0x67` answers with a LEN byte of `0x41`, declaring 65 bytes, and delivers
 one report (layout unknown).
 
-### LED and buzzer
+### Buzzer and LED
 
-    ff 00 40 <led> 04 <t1> <t2> <repeats> <buzzer link>
+    ff 00 40 50 04 <t1> <t2> <repeats> <buzzer link>
 
-The ACR122U layout, and `repeats` does count the beeps. `t1` and `t2` are the on
-and off phases in hundredths of a second.
+The buzzer works. `repeats` counts the beeps, confirmed against `03`. `t1` and
+`t2` are the on and off phases in hundredths of a second. The builder divides
+the duration its caller asks for by ten before storing it in one of them.
 
-`led` is the ACR122U state byte: bit 0 the red LED's final state, bit 1 green,
-bits 2 and 3 the masks saying which of the two to act on, bits 4 to 7 the same
-pair again for blinking. The vendor sends `0x50`, red blink only, which is why
-its own buzzer command shows nothing green. `0c`, `0d`, `0e` and `0f` are all
-accepted with `90 01`, but whether this reader has the green pin wired is
-untested. The `01` in the reply is constant and does not report LED state.
+`p2` is `0x50` and nothing else. The binary holds exactly one `0x40` builder, at
+`0x406c70`, and all three of its product branches store `0x50` as a literal. The
+software has no LED feature, and no LED, lamp or indicator string anywhere. That
+leaves nothing to copy.
+
+Read as an ACR122U, `p2` would be its LED state byte and `0x50` would be red
+blink only, which is a tidy story with no evidence behind it. The reader accepts
+every `p2` value with `90 01`, and none of them has moved the LED. The `01` is
+constant and does not report LED state.
+
+The reader lights green on its own when it detects a tag. The hardware is there
+and the host command for it is not in this binary.
+
+The twenty reader-level subcommands that answer `00` with no known effect were
+the last place to look, and they came up empty. Each of `0x80` `01` to `0f` and
+`0x82` `01` to `05` went out against an empty pad, three seconds apart, with
+someone watching the reader. No LED change and no audible change. `ff 00 82 00
+00` read back byte-identical afterwards, which rules out a silent persisted
+setting. All twenty are safe to send. Going one past either end wedges the
+reader.
+
+That leaves `0x67`, whose 65-byte reply has no known layout, and the `p1` space
+above `0x6f`, which cannot be swept without hitting the wedge. Neither is
+promising. The working assumption is now that firmware drives this reader's LED
+on tag detect and no host command reaches it.
 
 ## 125 kHz ID read (confirmed)
 
@@ -143,13 +166,17 @@ untested. The `01` in the reply is constant and does not report LED state.
     tx  ff 00 65 08 18 48 e8 01 00 00 00 00 00
     rx  05 c0 ff ee 00 01
 
-Reply is a length byte then that many bytes. `05` plus five bytes is an EM4100
-ID. `0x1e848` is 125000, the carrier in Hz, carried as a little-endian dword by
-every 125 kHz command.
+The reply is a length byte then that many bytes. `05` plus five bytes is an
+EM4100 ID. `0x1e848` is 125000, the carrier in Hz, carried as a little-endian
+dword by every 125 kHz command.
 
 `lc` sits where an APDU length belongs but is not one; eight data bytes always
 follow. The vendor pairs one `lc` per carrier. `w1` and `w2` look like
 demodulator thresholds.
+
+Both `p2` and `lc` are caller-supplied. The builder pre-fills `65 05 1e` and then
+overwrites offsets 3 and 4 from its arguments. The `05` and `1e` sitting in the
+template are defaults no call site uses.
 
 From `0x408cc0`, the most-called command in the binary at ~60 sites, all with
 `p2 = 0x08`. On LEN `0x0c` with `payload[0] == 5` it copies five bytes out. The
@@ -188,13 +215,13 @@ Block 0 is mandatory; writing only 1 and 2 leaves the tag silent and
 undetectable, which is the state a fresh blank arrives in. The vendor's own
 write path does not send block 0 and must configure the tag some other way.
 
-The frame is standard EM4100 w/ nine 1 bits, each of the ten ID nibbles followed
+The frame is standard EM4100 with nine 1 bits, each of the ten ID nibbles followed
 by its even parity bit, four column parity bits across the nibbles, a 0 stop
 bit. Most significant bit first into block 1.
 
-Every write answers `00`, never the `05` plus five bytes its own caller in the
-vendor binary validates against. Reading the tag back is the only trustworthy
-check I've found.
+Every write answers `00`. Its own caller in the vendor binary validates against
+`05` plus five bytes, which never arrives. Reading the tag back is the only
+trustworthy check I've found.
 
 ## The 0x66 family
 
@@ -206,7 +233,7 @@ data or a 5-byte ID:
 |------|-----------|-------|-------|
 | 41 | 1 | `04` + 4 | sampler start |
 | 46 | 1 | `28` + 40 | fetch 40 raw samples |
-| 12 | 4 | `05` + 5 | answers `00` for every block on every tag tried |
+| 12 | 4 | `05` + 5 | pre-write step, see below |
 | 21 | 4 | `05` + 5 | called by the vendor's write path |
 | 1f, 2f, 3f, 4f | 4 | `05` + 5 | |
 | 22, 32, 33, 34, 43, 44 | 4 | `05` + 5 | |
@@ -215,9 +242,17 @@ data or a 5-byte ID:
 | 13 | 8 | `05` + 5 | block write |
 | 40 | 22 | `04` + 4 | sampler config, tail `3c b4 64` |
 
-Code `0x12` is not a block read. The vendor calls it with an out pointer
-immediately before `0x13` with the same buffer, but it answers `00` for every
-block on both a blank and a freshly written tag. Purpose unknown.
+Code `0x12` is not a block read, and nothing else is either. Its builder at
+`0x40c260` takes the block number and a pointer to four bytes. The write path at
+`0x4172a0` hands it the very bytes it is about to write, sleeps 15 ms, and sends
+`0x13` with those same bytes plus the key. That makes `0x12` a pre-write step. It
+validates its reply as `05` plus five bytes, the shape of an ID rather than of a
+32-bit block.
+
+That closes the question for the whole family. Every `0x66` code validates a
+5-byte ID reply except the three sampler codes. No command in this protocol
+returns the contents of a T5577 block. A tag can be written and then identified
+by what it emits. It cannot be read back block by block.
 
 `0x40a5a0` is a raw sampler: code `40` to configure, sleep 30 ms, code `41` with
 argument 5, two code `46` fetches of 40 bytes at offsets 0 and 40, and a scan of
@@ -230,8 +265,9 @@ fetch at offset 40 gets no reply. Where the vendor reads 80 bytes latchkey reads
 40. An empty pad comes back 94 to 100 per cent ones, often every byte
 `ff`. `latchkey sample` prints them with the count.
 
-`0x417xxx` is a second write path, recovered and not sent. It calls codes `21`
-and `22` in a loop with sleeps, formatting with `%10.10u`.
+`0x417xxx` holds two write paths. `0x4172a0` is the `0x12` and `0x13` pair above.
+A separate one from `0x417d60` calls codes `21` and `22` in a loop with sleeps,
+formatting with `%10.10u`. Neither has been sent.
 
 ## Pacing, and the reader's own detection
 
@@ -249,19 +285,20 @@ correct checksum and the new sequence number:
     ff 00 00 00 02 d4 02  -> 00
     ff 00 00 00 02 d4 02  -> d5 03 32 01 06 07 90 00
 
-One bogus reply per abandoned command, no more. latchkey waits 1200 ms on a poll
-so this is rare, and re-sends once when a `00` arrives on the heels of a timeout.
+One bogus reply per abandoned command, no more. latchkey waits 1200 ms on a
+poll, which makes this rare. It re-sends once when a `00` arrives on the heels
+of a timeout.
 
-Separately: the reader detects tags in firmware, announcing it with two beeps and
-a green LED that holds while the tag sits there. Only a detected tag answers the
+The reader also detects tags in firmware, announcing it with two beeps and a
+green LED that holds while the tag sits there. Only a detected tag answers the
 `0x65` read, and that detection needs the reader idle. Polling every few hundred
-milliseconds starves it. The beeps and LED stop, and a tag set down while the
-host polls never becomes readable however many times it is asked. A tag detected
+milliseconds starves it. The beeps and LED stop. A tag set down while the host
+polls never becomes readable, however many times it is asked. A tag detected
 before the polling started keeps reading fine, which makes this easy to miss.
 
 Around 1.5 s of quiet per poll works on this reader. The threshold is not
-measured; `--poll-gap` and `watch --gap` exist to find it. Likeliest thing to
-differ on other models.
+measured; `--poll-gap` and `watch --gap` exist to find it. This is the likeliest
+thing to differ on other models.
 
 Whether a command re-arms the detector is unknown. `0x62`, card release, has 48
 call sites and is the obvious candidate, but its result is discarded and its
@@ -283,15 +320,23 @@ The vendor binary stops mattering from here; the PN532 manual is the spec.
     write     ff 00 00 00 <lc> d4 40 01 a0 <blk> <16>
     auth      ff 00 00 00 <lc> d4 40 01 <60|61> <blk> <key 6> <uid 4>
 
-Two inferences:
+The detect reply is `07` plus seven bytes. The parser at `0x406fa3` copies byte 1
+to a one-byte output and bytes 2-7 to a six-byte one, which is SAK then ATQA then
+UID. The order within those six is settled by what the parser does next: it
+retries the whole detect while byte 0 of the six is non-zero. That only makes
+sense for an ATQA high byte, which is `00` for every common answer (`00 04`,
+`00 02`, `00 44`). A UID first byte would fail that test on nearly every card.
 
-- The detect reply is `07` plus seven bytes. The parser at `0x406fa3` copies byte
-  1 to a one-byte output and bytes 2-7 to a six-byte one. latchkey reads them as
-  SAK, two ATQA bytes, four UID bytes. Which six are ATQA is not settled.
-  `latchkey hf --raw` prints the payload untouched; a real reply belongs here.
-- Card type comes from the published SAK table. The vendor's own tree at
-  `0x407031` compares against `0x20` and masks with `0xfc` in a way not worked
-  out.
+The MIFARE reply shapes are pinned by the vendor's own offset checks rather than
+by inference. Read at `0x40e960` wants LEN `0x1b` with `d5 41` at payload 0 and
+`90` at report offset 23, which is `d5 41 <status> <16 bytes> 90 00`. Write at
+`0x40eb00` wants LEN `0x0b` and `90` at offset 7, which is `d5 41 <status> 90 00`.
+
+One inference is left. Card type comes from the published SAK table. The vendor's
+own tree at `0x407031` compares against `0x20` and masks with `0xfc` in a way not
+worked out. Its format strings print a 4-byte UID for Classic and a 7-byte UID
+for UltraLight and DESFire. The 4 bytes latchkey keeps cover the Classic case
+only.
 
 The vendor does not recover unknown keys. `0x4281a0`, `0x43fc60` and `0x45fd40`
 reference `%s/keys/a%08x.dump` and `%s/keys/b%08x.dump`: per-UID key files on
@@ -310,9 +355,9 @@ disk, fed to the reader.
 
 The vendor issues `80 11`, `80 12`, `80 14` and `80 19`, all past the range this
 reader answers. Either they need an unreached state or they target another
-variant. A blank 125 kHz tag on the pad changes nothing in either sweep, so
-neither opcode is a tag read path. Handler `0x45e570` prints `Rf config : %2.2X`
-seven times then `done`, which is the `0x82` family.
+variant. A blank 125 kHz tag on the pad changes nothing in either sweep. Neither
+family is a tag read path. Handler `0x45e570` prints `Rf config : %2.2X` seven
+times then `done`, which is the `0x82` family.
 
 ### Hazard: subcommands past the end of a table
 
@@ -326,8 +371,10 @@ come back every time.
 ## Still unknown
 
 - Which `p1` values above `0x6f` exist. Sweeping them risks the wedge above.
-- The purpose of `0x66` codes `01`, `12`, `1f`, `22`, `2f`, `32`, `33`, `34`,
-  `3f`, `42`, `43`, `44` and `4f`.
+- The purpose of `0x66` codes `01`, `1f`, `22`, `2f`, `32`, `33`, `34`, `3f`,
+  `42`, `43`, `44` and `4f`. Codes `32`, `33`, `34`, `22`, `21`, `43`, `44` and
+  `42` all carry four caller-supplied bytes at 125 kHz, the same shape as the
+  write payload. Keep those away from a tag that matters.
 - Whether `ff 00 83 <16 bytes>` writes the configuration that `ff 00 82 00 00`
   reads. `p1 = 0x83` rejects a zero-length body with `fd`, which is consistent.
   It may hold the antenna selector. Untested, because a bad configuration write
@@ -336,10 +383,11 @@ come back every time.
 - Why nothing reacts to a blank 125 kHz tag. All three of `ff ca 00 00 00`,
   `ff b0 00 <addr> 04` and `ff 00 62 00 00` answer as if no card were present. A
   blank T5577 may equally have nothing an EM4100 read would return. The raw
-  sampler is the one lead: a tag loads the antenna whether or not it modulates,
-  so its 40 bytes may separate a blank from an empty pad where no decoded
+  sampler is the one lead. A tag loads the antenna whether or not it modulates,
+  and its 40 bytes may separate a blank from an empty pad where no decoded
   command can. Needs someone to run `latchkey sample` both ways and compare.
-- Whether the green LED is reachable, per the LED byte above.
+- Whether the LED is reachable from the host at all. Everything addressable has
+  been tried. See the buzzer section.
 
 ## How this was recovered
 

@@ -79,14 +79,17 @@ enum Cmd {
     /// Fetch 40 bytes of raw 125 kHz demodulator output. Read-only.
     ///
     /// An empty pad reads nearly all ones. Comparing that against a tag the
-    /// reader cannot decode is the one lead on telling a blank from nothing.
+    /// reader cannot decode is the one lead on spotting a blank.
     Sample {
         #[arg(long, default_value_t = 4)]
         times: u32,
     },
-    /// Dump the 32-bit blocks of a 125 kHz tag. Read-only.
+    /// Send the 0x66 code 0x12 for each block and print what comes back.
+    ///
+    /// This answers `00` for every block. The protocol has no block read, and
+    /// code 0x12 turns out to be a pre-write step. Kept for protocol work only.
     Blocks {
-        /// Highest block number to read. A T5577 has 0 through 7.
+        /// Highest block number to try. A T5577 has 0 through 7.
         #[arg(long, default_value_t = 7)]
         to: u8,
     },
@@ -355,17 +358,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Cmd::Wipe { yes } => {
             if !yes {
                 println!(
-                    "Would zero blocks 1 to 7 of the tag on the pad, then block 0.\n\
-                     Block 0 is the config word. The tag falls silent until a\n\
-                     `write --config` puts one back.\n\n\
+                    "Would zero all eight blocks of the tag on the pad, the config\n\
+                     word last. Silent afterwards until `write --config`.\n\n\
                      Nothing written. Add --yes to go ahead."
                 );
                 return Ok(());
             }
             let mut rd = Reader::open(cli.timeout)?;
             match rd.lf_id() {
-                Some((id, ..)) => println!("tag reads {} now\n", hex(&id)),
-                None => println!("no ID reads off the pad now\n"),
+                Some((id, ..)) => println!("tag reads {}\n", hex(&id)),
+                None => println!("no ID reads off the pad\n"),
             }
             for (blk, r) in rd.lf_wipe() {
                 match r {
@@ -375,8 +377,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
             // Blocks never read back, so a silent tag is the only check
             match rd.lf_id_tries(2) {
-                Some((id, ..)) => println!("\nstill reads {}. The wipe did not take.", hex(&id)),
-                None => println!("\nnothing reads off it now."),
+                Some((id, ..)) => println!("\nwipe failed. Still reads {}", hex(&id)),
+                None => println!("\nnothing reads off it."),
             }
         }
         Cmd::WriteBlock { block, data, yes } => {
@@ -559,7 +561,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 
             if locked > 0 {
                 println!("\n{locked} of {sectors} sectors had no key in the dictionary.");
-                println!("Their blocks read as zeroes in the output. They were never read.");
+                println!("The output holds zeroes for those. Nothing was read from them.");
             }
             if let Some(path) = out {
                 std::fs::write(&path, &dump)?;

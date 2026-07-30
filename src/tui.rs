@@ -38,19 +38,13 @@ const EMPTY_HOLD: Duration = Duration::from_millis(3000);
 const HF_EVERY: u64 = 4;
 
 /// Payloads this reader is known to answer. Nothing here writes to a tag
-const EXAMPLES: [(&str, &str); 18] = [
+const EXAMPLES: [(&str, &str); 14] = [
     ("firmware version", "ff 00 00 00 02 d4 02"),
     ("model string", "ff 00 68 00 00"),
     ("serial string", "ff 00 69 00 00"),
     ("reader info", "ff 00 80 00 00"),
     ("reader config", "ff 00 82 00 00"),
     ("buzzer, three beeps", "ff 00 40 50 04 01 05 03 01"),
-    // p2 is the ACR122U LED selector. Whether this reader wires it up is
-    // untested; all four are accepted
-    ("LED green", "ff 00 40 0e 04 00 00 00 00"),
-    ("LED red", "ff 00 40 0d 04 00 00 00 00"),
-    ("LED both", "ff 00 40 0f 04 00 00 00 00"),
-    ("LED off", "ff 00 40 0c 04 00 00 00 00"),
     ("125 kHz ID read", "ff 00 65 08 18 48 e8 01 00 00 00 00 00"),
     (
         "125 kHz code 12, unknown",
@@ -177,7 +171,7 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
             Job::ReadLf => Some("reading"),
             Job::WriteLf(..) | Job::WriteBlock(..) => Some("writing"),
             Job::Wipe => Some("wiping"),
-            Job::ReadBlocks => Some("reading blocks"),
+            Job::ReadBlocks => Some("probing blocks"),
             Job::Dump => Some("dumping"),
             Job::Raw(_) => Some("sending"),
             Job::Beep => Some("beeping"),
@@ -212,7 +206,7 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
                     Some(&(freq, _, id)) => {
                         let _ = tx.send(Event::Pad(Pad::Lf { id, freq }));
                     }
-                    None => say("no ID in any of the ten profiles".into(), true),
+                    None => say("no ID in any profile".into(), true),
                 }
             }
             Job::Wipe => {
@@ -228,14 +222,11 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
                 // Blocks never read back, so a silent tag is the only check
                 let ok = match rd.lf_id_quick(2) {
                     Some(id) => {
-                        say(
-                            format!("still reads {}. Wipe did not take.", hex(&id)),
-                            true,
-                        );
+                        say(format!("wipe failed. Still reads {}", hex(&id)), true);
                         false
                     }
                     None => {
-                        say("wiped. Nothing reads off it now.".into(), false);
+                        say("wiped. Nothing reads off it".into(), false);
                         true
                     }
                 };
@@ -317,7 +308,10 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
                             ok = false;
                         }
                         None => {
-                            say("wrote, but nothing reads back. Try block 0.".into(), true);
+                            say(
+                                "wrote, but nothing reads back. Try with block 0".into(),
+                                true,
+                            );
                             ok = false;
                         }
                     }
@@ -400,7 +394,7 @@ impl Screen {
             Self::Blocks => &[
                 ("up/down", "block"),
                 ("e", "edit"),
-                ("r", "read all"),
+                ("r", "probe all"),
                 ("w", "write"),
             ],
             Self::Console => &[("up/down", "pick"), ("e", "edit"), ("Enter", "send")],
@@ -545,12 +539,12 @@ impl App {
 
     fn next_step(&self) -> &'static str {
         match (&self.pad, self.origin) {
-            (Pad::Hf(_), _) => "13.56 MHz card. Screen 2 reads those.",
-            (Pad::Empty, Origin::Blank) => "set the tag you want to copy on the pad",
+            (Pad::Hf(_), _) => "13.56 MHz card. Screen 2 reads it.",
+            (Pad::Empty, Origin::Blank) => "set the tag to copy on the pad",
             (Pad::Empty, _) => "set a blank down. w writes.",
             (Pad::Lf { .. }, Origin::Blank) => "c captures this tag",
             (Pad::Lf { id, .. }, _) if *id == self.id => "the tag matches the buffer",
-            (Pad::Lf { .. }, _) => "w overwrites this tag with the buffer",
+            (Pad::Lf { .. }, _) => "w overwrites this tag",
         }
     }
 
@@ -602,30 +596,25 @@ impl App {
     fn stage_write_lf(&mut self) {
         if let Some(e) = &self.field_err {
             let e = e.clone();
-            self.log(format!("fix the ID first: {e}"), true);
+            self.log(format!("bad ID: {e}"), true);
             return;
         }
         let id = self.id;
         let mut prompt = vec![format!("Write {} to the tag on the pad?", hex(&id))];
         match &self.pad {
-            Pad::Empty => prompt
-                .push("Nothing reads on the pad. Normal for a blank, which is silent until block 0 is set.".into()),
+            Pad::Empty => prompt.push("Nothing reads on the pad. Normal for a blank.".into()),
             Pad::Lf { id: cur, .. } if *cur == id => {
                 prompt.push(format!("It already reads as {}.", hex(cur)))
             }
-            Pad::Lf { id: cur, .. } => prompt.push(format!(
-                "WARNING: the tag reads as {}. That will be erased. Stop if you cannot replace it.",
-                hex(cur)
-            )),
+            Pad::Lf { id: cur, .. } => prompt.push(format!("WARNING: this erases {}.", hex(cur))),
             Pad::Hf(c) => prompt.push(format!(
-                "A {} is on the pad. A 125 kHz write will not touch it.",
+                "A {} is on the pad. This touches 125 kHz only.",
                 c.kind()
             )),
         }
         if self.write_config {
-            prompt.push(format!("Block 0 will be set to {}.", hex(&T5577_EM4100)));
+            prompt.push(format!("Block 0 <- {}.", hex(&T5577_EM4100)));
         }
-        prompt.push("y to go ahead. Any other key cancels.".into());
         self.confirm = Some(Confirm {
             prompt,
             job: Job::WriteLf(id, self.write_config),
@@ -647,17 +636,14 @@ impl App {
         let blk = self.block_sel;
         let mut prompt = vec![format!("Write {} to block {blk}?", hex(&data))];
         if blk == 0 {
-            prompt.push(
-                "Block 0 is the config word. A wrong value stops the tag emitting at all.".into(),
-            );
+            prompt.push("Block 0 is the config word. A wrong value silences the tag.".into());
         }
         if let Pad::Lf { id, .. } = &self.pad {
             prompt.push(format!(
-                "The tag reads as {}. Blocks 1 and 2 change that.",
+                "The tag reads as {}. Blocks 1 and 2 hold that.",
                 hex(id)
             ));
         }
-        prompt.push("y to go ahead. Any other key cancels.".into());
         self.confirm = Some(Confirm {
             prompt,
             job: Job::WriteBlock(blk, data),
@@ -678,19 +664,15 @@ impl App {
     fn stage_wipe(&mut self) {
         let mut prompt = vec!["Wipe every block of the tag on the pad?".into()];
         match &self.pad {
-            Pad::Lf { id, .. } => prompt.push(format!(
-                "It reads as {}. Write that down first if you want it back.",
-                hex(id)
-            )),
-            Pad::Empty => prompt.push("Nothing reads on the pad. A blank wipes fine.".into()),
+            Pad::Lf { id, .. } => prompt.push(format!("WARNING: this erases {}.", hex(id))),
+            Pad::Empty => prompt.push("Nothing reads on the pad.".into()),
             Pad::Hf(c) => prompt.push(format!(
-                "A {} is on the pad. A 125 kHz wipe will not touch it.",
+                "A {} is on the pad. This touches 125 kHz only.",
                 c.kind()
             )),
         }
-        prompt.push("Blocks 1 to 7 go to zero. Block 0, the config word, goes last.".into());
-        prompt.push("The tag falls silent. w with block 0 on brings it back.".into());
-        prompt.push("y to go ahead. Any other key cancels.".into());
+        prompt.push("All eight blocks go to zero, the config word last.".into());
+        prompt.push("Silent afterwards until w writes block 0.".into());
         self.confirm = Some(Confirm {
             prompt,
             job: Job::Wipe,
@@ -1017,6 +999,9 @@ fn draw_blocks(f: &mut Frame, app: &App, area: Rect) {
         );
         lines.push(Line::from(spans));
     }
+    lines.push(Line::from(""));
+    lines.push(note("no block read exists in this protocol."));
+    lines.push(note("the column is what code 0x12 answers."));
     f.render_widget(Paragraph::new(lines).block(panel("T5577 page 0")), area);
 }
 
@@ -1032,12 +1017,11 @@ fn draw_card(f: &mut Frame, app: &App, area: Rect) {
             row("s", "save to <uid>.dump"),
             Line::from(""),
             note(&format!(
-                "{} keys tried per sector. Unknown keys",
+                "{} keys per sector. Unknown keys read locked.",
                 KEYS.len()
             )),
-            note("are not recovered; those sectors read locked."),
             Line::from(""),
-            Line::from(" Untested. No card has ever answered this.").yellow(),
+            Line::from(" Untested. No card has answered this.").yellow(),
         ];
         f.render_widget(Paragraph::new(lines).block(panel("MIFARE Classic")), area);
         return;
@@ -1071,8 +1055,8 @@ fn draw_console(f: &mut Frame, app: &App, area: Rect) {
     payload.extend(app.console.spans(app.editing));
     let lines = vec![
         Line::from(payload),
-        note("length, sequence and checksum are added"),
-        Line::from(" A subcommand past the end of a table wedges the reader.").yellow(),
+        note("length, sequence and checksum added"),
+        Line::from(" An out-of-range subcommand wedges the reader.").yellow(),
     ];
     f.render_widget(
         Paragraph::new(lines).block(panel(if app.editing {
@@ -1115,7 +1099,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
         row("up/down", "move within screen"),
         row("e", "edit"),
         row("Enter", "accept"),
-        row("Esc", "abandon edit"),
+        row("Esc", "cancel edit"),
         row("b", "buzzer"),
         row("q", "quit"),
         Line::from(""),
@@ -1123,7 +1107,7 @@ fn draw_help(f: &mut Frame, app: &App, area: Rect) {
     ];
     lines.extend(app.screen.keys().iter().map(|(k, what)| row(k, *what)));
     lines.push(Line::from(""));
-    lines.push(note("Writes ask first. Only y goes ahead."));
+    lines.push(note("Writes ask first. Only y confirms."));
 
     let area = center(area, 46, lines.len() as u16 + 2);
     f.render_widget(Clear, area);

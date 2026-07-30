@@ -1,16 +1,16 @@
 # latchkey
 
-A host-side driver/TUI for NSCCN wCopy-family RFID readers, on macOS and
-Linux. These readers ship with Windows-only software; latchkey speaks the same
-USB protocol natively.
+A host-side driver/TUI for NSCCN wCopy-family RFID readers on macOS and Linux.
+These readers ship with Windows-only software; latchkey speaks the same USB
+protocol natively.
 
 Reads and writes 125 kHz tags, identifies and reads 13.56 MHz cards, and exposes
 the reader's raw command interface.
 
 Not affiliated with NSCCN; the protocol was recovered by static analysis of the
 vendor's Windows binary. [docs/PROTOCOL.md](docs/PROTOCOL.md) is its reference.
-This was simply written as a fun evening project and because I was too stubborn
-to order another reador or spin up my dusty Windows VM.
+This was written as a fun evening project and because I was too stubborn to
+order another reader or spin up my dusty Windows VM.
 
 ## How finished is this?
 
@@ -25,7 +25,7 @@ Beta. Alpha, even. Only tested with one reader and one tag family.
 | MIFARE Ultralight, DESFire        | identify only | no                  | **no**            |
 | Raw reader commands               | yes           | yes                 | yes               |
 
-"Confirmed" means reproduced on one USB `2518:6018` against EM4100 fobs and
+The last column means reproduced on one USB `2518:6018` against EM4100 fobs and
 T5577 blanks at 125 kHz. That path works end to end. Everything else is built
 from the disassembly alone. Expect rough edges on the tested path too.
 
@@ -33,8 +33,9 @@ from the disassembly alone. Expect rough edges on the tested path too.
 
     latchkey
 
-Left and right move between screens, `1`-`4` jump. Up and down move within one.
-`e` edits, `Enter` accepts, `Esc` reverts, `?` lists keys, `q` quits.
+Left and right move between screens and `1`-`4` jump straight to one. Up and
+down move within a screen. `e` edits, `Enter` accepts, `Esc` reverts, `?` lists
+keys, `q` quits.
 
 A line under the ID names the next useful action for whatever state you are in.
 
@@ -44,10 +45,11 @@ A line under the ID names the next useful action for whatever state you are in.
   back to a blank.
 - Card identifies a 13.56 MHz card and dumps MIFARE Classic sectors. `s`
   saves. A sector no key opens reads locked rather than zeroed.
-- Blocks is the T5577 block by block. For tags that are not plain EM4100.
-- Console sends an arbitrary payload. Up and down walk the commands this
-  reader is known to answer and load the one you land on. Length, sequence
-  and checksum are added automatically; a bad reply checksum is flagged.
+- Blocks writes one T5577 block at a time, for tags that are not plain EM4100.
+  It cannot show you what is on a block. The protocol has no block read.
+- Console sends an arbitrary payload. Up and down walk the known commands and
+  load the one you land on. latchkey adds the length, sequence and checksum,
+  and flags a bad checksum on the reply.
 
 ## Command line
 
@@ -68,22 +70,21 @@ Every screen's also a subcommand.
 Drop `--yes` to see the plan without sending it.
 
     $ latchkey wipe --yes
-    tag reads 12 34 56 78 9a now
+    tag reads 12 34 56 78 9a
 
     block 1 <- 00 00 00 00  -> 00
     ...
     block 0 <- 00 00 00 00  -> 00
 
-    nothing reads off it now.
+    nothing reads off it.
 
-`wipe` zeroes blocks 1 to 7 and then block 0. An interrupted run leaves the tag
-still emitting. Afterwards the tag is silent until a `write --config` gives it a
-config word again.
+`wipe` zeroes blocks 1 to 7 before block 0. That ordering means an interrupted
+run leaves the tag still emitting. Afterwards it emits nothing until a
+`write --config`.
 
-`--config` writes block 0, the word that makes a T5577 emit EM4100 at all. A
-bag-fresh blank has no valid config, emits nothing, and is invisible to the
-reader. `--config` is needed the first time any tag is programmed. Repeating it
-is harmless.
+`--config` writes block 0, the word that makes a T5577 emit EM4100. A bag-fresh
+blank has no valid config, emits nothing, and is invisible to the reader. Pass
+`--config` the first time any tag is programmed. Repeating it is harmless.
 
 ## Hardware
 
@@ -101,17 +102,22 @@ Nothing observed writes to its flash, and it has recovered every time for me.
 
 ## Contributing
 
-This'll probably end up abandoned now that I've written the fobs I needed to,
-but, roughly in priority order:
+This'll probably end up abandoned now that I've written the fobs I needed to.
+Roughly in priority order:
 
 - Run the 13.56 MHz paths against a real card. `latchkey hf --raw` prints the
-  detect reply untouched, which is all that is needed to pin the field layout.
+  detect reply untouched, which is what would confirm the field layout the
+  disassembly implies.
+- Tell a blank tag from an empty pad. `latchkey sample` returns 40 bytes of raw
+  demodulator output, and an empty pad reads 94 to 100 per cent ones. Whether a
+  blank shifts that is the open question, and the answer would fill in the one
+  state the reader cannot otherwise report.
 - Other wCopy product IDs.
 - The unidentified 125 kHz `0x66` codes. `docs/PROTOCOL.md` tables them with
   argument lengths; `lf-probe` sends them at a throwaway tag and reports what
   changed.
-- Non-EM4100 125 kHz protocols, via the raw sampler (`0x66` codes `40`, `41`,
-  `46`), which returns samples rather than a decoded ID.
+- Non-EM4100 125 kHz protocols, via the raw sampler, which returns samples
+  rather than a decoded ID.
 
 ## Building
 
