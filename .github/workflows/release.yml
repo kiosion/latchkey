@@ -8,7 +8,18 @@ permissions:
   contents: write
 
 jobs:
+  # upload-rust-binary-action only uploads to a release. Something has to make
+  # one first, and a separate job avoids three matrix jobs racing to do it
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/create-gh-release-action@v1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
   upload:
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
