@@ -1,0 +1,45 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  upload:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # hidapi builds its hidraw backend against libudev
+      - name: Install libudev
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: latchkey
+          target: ${{ matrix.target }}
+          archive: $bin-$tag-$target
+          include: README.md,LICENSE,docs/PROTOCOL.md
+          checksum: sha256
+          locked: true
+          token: ${{ secrets.GITHUB_TOKEN }}
