@@ -93,7 +93,7 @@ enumerates the set exhaustively and yields 42 wrappers.
 | 00 | `d4 40 01 30 <blk>` | 16 bytes + `90 00` | MIFARE read block |
 | 00 | `d4 40 01 a0 <blk> <16>` | `90 00` | MIFARE write block |
 | 00 | caller-supplied `d4 ...` | var | generic PN532 passthrough, 24 call sites |
-| 40 | `50 04 01 <dur> 01` | `90 00` | LED and buzzer, duration is arg/10 |
+| 40 | `<led> 04 <t1> <t2> <reps> <buzz>` | `90 01` | LED and buzzer |
 | 61 | `01` | `90 00` | card activate, precedes every MIFARE read |
 | 62 | `01` | `90 00` | card release, 48 call sites |
 | 65 | `p2 = 08` | `05` + 5 | 125 kHz ID read |
@@ -121,6 +121,20 @@ except `ca`, which returns an all-zero UID plus `90 00`:
 
 `p1 = 0x67` answers with a LEN byte of `0x41`, declaring 65 bytes, and delivers
 one report (layout unknown).
+
+### LED and buzzer
+
+    ff 00 40 <led> 04 <t1> <t2> <repeats> <buzzer link>
+
+The ACR122U layout, and `repeats` does count the beeps. `t1` and `t2` are the on
+and off phases in hundredths of a second.
+
+`led` is the ACR122U state byte: bit 0 the red LED's final state, bit 1 green,
+bits 2 and 3 the masks saying which of the two to act on, bits 4 to 7 the same
+pair again for blinking. The vendor sends `0x50`, red blink only, which is why
+its own buzzer command shows nothing green. `0c`, `0d`, `0e` and `0f` are all
+accepted with `90 01`, but whether this reader has the green pin wired is
+untested. The `01` in the reply is constant and does not report LED state.
 
 ## 125 kHz ID read (confirmed)
 
@@ -210,14 +224,33 @@ argument 5, two code `46` fetches of 40 bytes at offsets 0 and 40, and a scan of
 the 80 bytes for `ff ff ff`. This is the route to 125 kHz protocols other than
 EM4100.
 
+Codes `41` and `46` work without the code `40` step (confirmed). `41` arms the
+sampler and answers `00`; `46` returns 40 bytes of demodulator output. A second
+fetch at offset 40 gets no reply. Where the vendor reads 80 bytes latchkey reads
+40. An empty pad comes back 94 to 100 per cent ones, often every byte
+`ff`. `latchkey sample` prints them with the count.
+
 `0x417xxx` is a second write path, recovered and not sent. It calls codes `21`
 and `22` in a loop with sleeps, formatting with `%10.10u`.
 
 ## Pacing, and the reader's own detection
 
 The reader drops commands if pushed. After one successful read the next few get
-no reply before it recovers. The vendor sleeps 30 ms between 125 kHz commands and
-so does latchkey.
+no reply before it recovers. The vendor sleeps 30 ms between 125 kHz commands.
+latchkey holds 40 ms between any two, gated in one place so every path pays it.
+
+A `0x65` read of an empty pad takes 700 to 1100 ms to answer its `00`, and about
+half the time never answers at all. Giving up early has a price. The reader
+finishes the command in its own time and stamps the answer it owes onto the next
+request. A host that abandons a read gets `00` to whatever it asks next, with a
+correct checksum and the new sequence number:
+
+    ff 00 65 08 18 ...       abandoned after 50 ms
+    ff 00 00 00 02 d4 02  -> 00
+    ff 00 00 00 02 d4 02  -> d5 03 32 01 06 07 90 00
+
+One bogus reply per abandoned command, no more. latchkey waits 1200 ms on a poll
+so this is rare, and re-sends once when a `00` arrives on the heels of a timeout.
 
 Separately: the reader detects tags in firmware, announcing it with two beeps and
 a green LED that holds while the tag sits there. Only a detected tag answers the
@@ -302,7 +335,11 @@ come back every time.
 - The `0x67` reply layout.
 - Why nothing reacts to a blank 125 kHz tag. All three of `ff ca 00 00 00`,
   `ff b0 00 <addr> 04` and `ff 00 62 00 00` answer as if no card were present. A
-  blank T5577 may equally have nothing an EM4100 read would return.
+  blank T5577 may equally have nothing an EM4100 read would return. The raw
+  sampler is the one lead: a tag loads the antenna whether or not it modulates,
+  so its 40 bytes may separate a blank from an empty pad where no decoded
+  command can. Needs someone to run `latchkey sample` both ways and compare.
+- Whether the green LED is reachable, per the LED byte above.
 
 ## How this was recovered
 

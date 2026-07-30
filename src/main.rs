@@ -30,11 +30,14 @@ enum Cmd {
     Info,
     /// Send the PN532 GetFirmwareVersion passthrough.
     Probe,
-    /// Sound buzzer and flash LED.
+    /// Sound the buzzer.
     Beep {
         /// Duration in tenths of a second.
         #[arg(long, default_value_t = 5)]
         dur: u8,
+        /// How many times.
+        #[arg(long, default_value_t = 1)]
+        reps: u8,
     },
     /// Send an arbitrary payload, e.g. `raw "ff 00 80 01 00"`.
     Raw { payload: String },
@@ -59,6 +62,11 @@ enum Cmd {
         #[arg(long)]
         yes: bool,
     },
+    /// Zero every block of a 125 kHz tag, the config word included. Needs --yes.
+    Wipe {
+        #[arg(long)]
+        yes: bool,
+    },
     /// Write one raw 32-bit block. Needs --yes. For protocol work.
     WriteBlock {
         #[arg(value_parser = hexarg)]
@@ -67,6 +75,14 @@ enum Cmd {
         data: String,
         #[arg(long)]
         yes: bool,
+    },
+    /// Fetch 40 bytes of raw 125 kHz demodulator output. Read-only.
+    ///
+    /// An empty pad reads nearly all ones. Comparing that against a tag the
+    /// reader cannot decode is the one lead on telling a blank from nothing.
+    Sample {
+        #[arg(long, default_value_t = 4)]
+        times: u32,
     },
     /// Dump the 32-bit blocks of a 125 kHz tag. Read-only.
     Blocks {
@@ -246,9 +262,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             let mut rd = Reader::open(cli.timeout)?;
             transact(&mut rd, &proto::pn532(&[0x02]))?;
         }
-        Cmd::Beep { dur } => {
+        Cmd::Beep { dur, reps } => {
             let mut rd = Reader::open(cli.timeout)?;
-            println!("{}", hex(&rd.beep(dur)?));
+            println!("{}", hex(&rd.beep(dur, reps)?));
         }
         Cmd::Raw { payload } => {
             let mut rd = Reader::open(cli.timeout)?;
@@ -336,6 +352,33 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 None => println!("  no ID read back"),
             }
         }
+        Cmd::Wipe { yes } => {
+            if !yes {
+                println!(
+                    "Would zero blocks 1 to 7 of the tag on the pad, then block 0.\n\
+                     Block 0 is the config word. The tag falls silent until a\n\
+                     `write --config` puts one back.\n\n\
+                     Nothing written. Add --yes to go ahead."
+                );
+                return Ok(());
+            }
+            let mut rd = Reader::open(cli.timeout)?;
+            match rd.lf_id() {
+                Some((id, ..)) => println!("tag reads {} now\n", hex(&id)),
+                None => println!("no ID reads off the pad now\n"),
+            }
+            for (blk, r) in rd.lf_wipe() {
+                match r {
+                    Ok(p) => println!("block {blk} <- 00 00 00 00  -> {}", hex(&p)),
+                    Err(e) => println!("block {blk} <- 00 00 00 00  -> {e}"),
+                }
+            }
+            // Blocks never read back, so a silent tag is the only check
+            match rd.lf_id_tries(2) {
+                Some((id, ..)) => println!("\nstill reads {}. The wipe did not take.", hex(&id)),
+                None => println!("\nnothing reads off it now."),
+            }
+        }
         Cmd::WriteBlock { block, data, yes } => {
             let data: [u8; 4] = unhex(&data)?
                 .try_into()
@@ -347,6 +390,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             }
             let mut rd = Reader::open(cli.timeout)?;
             transact(&mut rd, &payload)?;
+        }
+        Cmd::Sample { times } => {
+            let mut rd = Reader::open(cli.timeout)?;
+            for _ in 0..times {
+                match rd.lf_samples() {
+                    Ok(s) => {
+                        let ones: u32 = s.iter().map(|b| b.count_ones()).sum();
+                        println!("ones {ones:>3}/{}  {}", s.len() * 8, hex(&s));
+                    }
+                    Err(e) => println!("{e}"),
+                }
+            }
         }
         Cmd::Blocks { to } => {
             let mut rd = Reader::open(cli.timeout)?;
@@ -613,4 +668,3 @@ fn main() {
         std::process::exit(1);
     }
 }
-

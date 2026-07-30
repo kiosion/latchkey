@@ -31,13 +31,38 @@ const LAST_BLOCK: u8 = 7;
 /// long is the safe direction
 pub const IDLE_GAP: u64 = 1500;
 
-const POLL_TRIES: u32 = 2;
-
 /// A stale tag for three seconds costs nothing; flickering costs a lot
 const EMPTY_HOLD: Duration = Duration::from_millis(3000);
 
 /// One command per poll is the budget, so HF gets every fourth
 const HF_EVERY: u64 = 4;
+
+/// Payloads this reader is known to answer. Nothing here writes to a tag
+const EXAMPLES: [(&str, &str); 18] = [
+    ("firmware version", "ff 00 00 00 02 d4 02"),
+    ("model string", "ff 00 68 00 00"),
+    ("serial string", "ff 00 69 00 00"),
+    ("reader info", "ff 00 80 00 00"),
+    ("reader config", "ff 00 82 00 00"),
+    ("buzzer, three beeps", "ff 00 40 50 04 01 05 03 01"),
+    // p2 is the ACR122U LED selector. Whether this reader wires it up is
+    // untested; all four are accepted
+    ("LED green", "ff 00 40 0e 04 00 00 00 00"),
+    ("LED red", "ff 00 40 0d 04 00 00 00 00"),
+    ("LED both", "ff 00 40 0f 04 00 00 00 00"),
+    ("LED off", "ff 00 40 0c 04 00 00 00 00"),
+    ("125 kHz ID read", "ff 00 65 08 18 48 e8 01 00 00 00 00 00"),
+    (
+        "125 kHz code 12, unknown",
+        "ff 00 66 00 1e 48 e8 01 00 12 00 00 00 00 00 00",
+    ),
+    ("125 kHz sampler start", "ff 00 66 00 1e 48 e8 01 00 41 05"),
+    ("125 kHz sampler fetch", "ff 00 66 00 1e 48 e8 01 00 46 00"),
+    ("13.56 MHz detect", "ff 00 6a 01 00 08"),
+    ("13.56 MHz card release", "ff 00 62 01 00"),
+    ("PC/SC get data", "ff ca 00 00 00"),
+    ("PC/SC read binary", "ff b0 00 00 04"),
+];
 
 /// ASCII only, which keeps the cursor a plain byte index
 #[derive(Default, Clone)]
@@ -108,6 +133,7 @@ enum Job {
     /// Full profile sweep, unlike the poll's single profile
     ReadLf,
     WriteLf([u8; 5], bool),
+    Wipe,
     ReadBlocks,
     WriteBlock(u8, [u8; 4]),
     Dump,
@@ -132,9 +158,14 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
     let say = |m: String, bad: bool| {
         let _ = tx.send(Event::Log(m, bad));
     };
-    // A poll waits out its timeout on an empty pad, so it gets a short one
+    // An empty pad takes the reader about a second to report. Cutting the wait
+    // short only moves that reply onto the next command
     let full = rd.timeout;
-    const POLL_TIMEOUT: i32 = 200;
+    const POLL_TIMEOUT: i32 = 1200;
+
+    if let Ok((model, serial)) = rd.ident() {
+        say(format!("{model}  serial {serial}"), false);
+    }
 
     while let Ok(job) = jobs.recv() {
         rd.timeout = if matches!(job, Job::Poll(_)) {
@@ -145,6 +176,7 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
         let busy = match &job {
             Job::ReadLf => Some("reading"),
             Job::WriteLf(..) | Job::WriteBlock(..) => Some("writing"),
+            Job::Wipe => Some("wiping"),
             Job::ReadBlocks => Some("reading blocks"),
             Job::Dump => Some("dumping"),
             Job::Raw(_) => Some("sending"),
@@ -158,7 +190,7 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
         match job {
             Job::Quit => return,
             Job::Poll(check_hf) => {
-                let pad = match rd.lf_id_quick(POLL_TRIES) {
+                let pad = match rd.lf_id_quick(1) {
                     Some(id) => Pad::Lf { id, freq: 125_000 },
                     None if check_hf => match rd.hf_card() {
                         Some(c) => Pad::Hf(c),
@@ -172,16 +204,45 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
                 continue;
             }
             Job::ReadLf => {
-                match rd.lf_id_tries(2) {
-                    Some((id, freq, lc)) => {
-                        say(format!("{freq} Hz lc {lc:02x}  {}", hex(&id)), false);
+                let hits = rd.lf_profiles();
+                for (freq, lc, id) in &hits {
+                    say(format!("{freq} Hz lc {lc:02x}  {}", hex(id)), false);
+                }
+                match hits.first() {
+                    Some(&(freq, _, id)) => {
                         let _ = tx.send(Event::Pad(Pad::Lf { id, freq }));
                     }
-                    None => say("no ID in any profile".into(), true),
+                    None => say("no ID in any of the ten profiles".into(), true),
+                }
+            }
+            Job::Wipe => {
+                for (blk, r) in rd.lf_wipe() {
+                    match r {
+                        Ok(p) => say(
+                            format!("block {blk} <- 00 00 00 00  reply {}", hex(&p)),
+                            false,
+                        ),
+                        Err(e) => say(format!("block {blk}: {e}"), true),
+                    }
+                }
+                // Blocks never read back, so a silent tag is the only check
+                let ok = match rd.lf_id_quick(2) {
+                    Some(id) => {
+                        say(
+                            format!("still reads {}. Wipe did not take.", hex(&id)),
+                            true,
+                        );
+                        false
+                    }
+                    None => {
+                        say("wiped. Nothing reads off it now.".into(), false);
+                        true
+                    }
                 };
+                let _ = rd.beep(1, if ok { 1 } else { 3 });
             }
             Job::Beep => {
-                match rd.beep(5) {
+                match rd.beep(5, 1) {
                     Ok(_) => say("beep".into(), false),
                     Err(e) => say(e, true),
                 };
@@ -240,6 +301,7 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
                     }
                 }
                 // A write answers `00` whatever happened, so read it back
+                let mut ok = !failed;
                 if !failed {
                     match rd.lf_id_tries(3) {
                         Some((got, freq, _)) if got == id => {
@@ -252,10 +314,16 @@ fn worker(mut rd: Reader, jobs: Receiver<Job>, tx: Sender<Event>) {
                                 true,
                             );
                             let _ = tx.send(Event::Pad(Pad::Lf { id: got, freq }));
+                            ok = false;
                         }
-                        None => say("wrote, but nothing reads back. Try block 0.".into(), true),
+                        None => {
+                            say("wrote, but nothing reads back. Try block 0.".into(), true);
+                            ok = false;
+                        }
                     }
                 }
+                // One beep for a tag that reads back, three for anything else
+                let _ = rd.beep(1, if ok { 1 } else { 3 });
             }
             Job::Dump => {
                 let Some(card) = rd.hf_card() else {
@@ -326,6 +394,7 @@ impl Screen {
                 ("r", "read"),
                 ("0", "block 0"),
                 ("w", "write"),
+                ("x", "wipe"),
             ],
             Self::Card => &[("d", "dump"), ("s", "save")],
             Self::Blocks => &[
@@ -334,7 +403,7 @@ impl Screen {
                 ("r", "read all"),
                 ("w", "write"),
             ],
-            Self::Console => &[("e", "edit"), ("Enter", "send")],
+            Self::Console => &[("up/down", "pick"), ("e", "edit"), ("Enter", "send")],
         }
     }
 
@@ -393,6 +462,7 @@ struct App {
 
     dump: Vec<Sector>,
     console: Input,
+    example: usize,
 
     editing: bool,
     /// State as editing began, for Esc to restore
@@ -421,12 +491,13 @@ impl App {
             block_field: Input::default(),
             dump: Vec::new(),
             console: Input::default(),
+            example: 0,
             editing: false,
             snap: None,
         };
         a.sync_field();
         a.block_field.set("00 00 00 00");
-        a.console.set("ff 00 00 00 02 d4 02");
+        a.console.set(EXAMPLES[0].1);
         a.log("? for keys", false);
         a
     }
@@ -593,6 +664,39 @@ impl App {
         });
     }
 
+    /// Loads as it moves, so the field always holds what Enter would send
+    fn pick_example(&mut self, back: bool) {
+        let n = EXAMPLES.len();
+        self.example = if back {
+            (self.example + n - 1) % n
+        } else {
+            (self.example + 1) % n
+        };
+        self.console.set(EXAMPLES[self.example].1);
+    }
+
+    fn stage_wipe(&mut self) {
+        let mut prompt = vec!["Wipe every block of the tag on the pad?".into()];
+        match &self.pad {
+            Pad::Lf { id, .. } => prompt.push(format!(
+                "It reads as {}. Write that down first if you want it back.",
+                hex(id)
+            )),
+            Pad::Empty => prompt.push("Nothing reads on the pad. A blank wipes fine.".into()),
+            Pad::Hf(c) => prompt.push(format!(
+                "A {} is on the pad. A 125 kHz wipe will not touch it.",
+                c.kind()
+            )),
+        }
+        prompt.push("Blocks 1 to 7 go to zero. Block 0, the config word, goes last.".into());
+        prompt.push("The tag falls silent. w with block 0 on brings it back.".into());
+        prompt.push("y to go ahead. Any other key cancels.".into());
+        self.confirm = Some(Confirm {
+            prompt,
+            job: Job::Wipe,
+        });
+    }
+
     fn send_console(&mut self) {
         match proto::unhex(&self.console.value) {
             Ok(p) if p.is_empty() => self.log("nothing to send", true),
@@ -708,6 +812,7 @@ impl App {
                 }
                 KeyCode::Char('c') => self.capture(),
                 KeyCode::Char('w') => self.stage_write_lf(),
+                KeyCode::Char('x') => self.stage_wipe(),
                 KeyCode::Char('0') => {
                     self.write_config = !self.write_config;
                     let on = self.write_config;
@@ -732,11 +837,11 @@ impl App {
                 KeyCode::Char('w') => self.stage_write_block(),
                 _ => {}
             },
-            Screen::Console => {
-                if k == KeyCode::Enter {
-                    self.send_console();
-                }
-            }
+            Screen::Console => match k {
+                _ if up || down => self.pick_example(up),
+                KeyCode::Enter => self.send_console(),
+                _ => {}
+            },
         }
     }
 }
@@ -777,14 +882,15 @@ fn draw_pad(f: &mut Frame, app: &App, area: Rect) {
         ],
         Pad::Lf { id, freq } => vec![
             Line::from(vec![
-                Span::from(" 125 kHz   ").dark_gray(),
+                Span::from(format!(" {:<10}", format!("{} kHz", freq / 1000))).dark_gray(),
                 Span::styled(hex(id), Style::new().fg(Color::Green).bold()),
-                Span::from(format!("   {freq} Hz")).dark_gray(),
             ]),
             Line::from(vec![
                 Span::from(" EM4100    ").dark_gray(),
+                // Neither decimal form covers byte 0
                 Span::from(format!(
-                    "dec10 {}    dec3+5 {}",
+                    "cust {:<6}dec10 {}   dec3+5 {}",
+                    id[0],
                     proto::em4100_show(*id, IdForm::Dec10),
                     proto::em4100_show(*id, IdForm::Dec35)
                 )),
@@ -959,14 +1065,14 @@ fn draw_card(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_console(f: &mut Frame, app: &App, area: Rect) {
-    let [field, examples] =
-        Layout::vertical([Constraint::Length(4), Constraint::Min(0)]).areas(area);
+    let [field, list] = Layout::vertical([Constraint::Length(5), Constraint::Min(0)]).areas(area);
 
     let mut payload = vec![Span::from(" ")];
     payload.extend(app.console.spans(app.editing));
     let lines = vec![
         Line::from(payload),
         note("length, sequence and checksum are added"),
+        Line::from(" A subcommand past the end of a table wedges the reader.").yellow(),
     ];
     f.render_widget(
         Paragraph::new(lines).block(panel(if app.editing {
@@ -977,23 +1083,29 @@ fn draw_console(f: &mut Frame, app: &App, area: Rect) {
         field,
     );
 
-    // Two lines per example keeps each payload on one line and copyable
-    const EXAMPLES: [(&str, &str); 5] = [
-        ("firmware version", "ff 00 00 00 02 d4 02"),
-        ("13.56 MHz detect", "ff 00 6a 01 00 08"),
-        ("buzzer and LED", "ff 00 40 50 04 01 05 01 01"),
-        ("reader config", "ff 00 82 00 00"),
-        ("125 kHz ID read", "ff 00 65 08 18 48 e8 01 00 00 00 00 00"),
-    ];
+    // Two lines per entry keeps each payload whole and copyable
     let mut lines = Vec::new();
-    for (what, bytes) in EXAMPLES {
-        lines.push(note(what));
+    for (i, (what, bytes)) in EXAMPLES.iter().enumerate() {
+        let here = i == app.example;
+        let label = Line::from(format!(" {} {what}", if here { '>' } else { ' ' }));
+        lines.push(if here {
+            label.yellow()
+        } else {
+            label.dark_gray()
+        });
         lines.push(Line::from(format!("   {bytes}")));
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(" Some subcommands wedge the reader until").yellow());
-    lines.push(Line::from(" it is replugged. See PROTOCOL.md.").yellow());
-    f.render_widget(Paragraph::new(lines).block(panel("Examples")), examples);
+    let rows = list.height.saturating_sub(2) as usize;
+    // Keep the selected pair on screen
+    let scroll = (app.example * 2 + 2)
+        .saturating_sub(rows)
+        .min(lines.len().saturating_sub(rows));
+    f.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll as u16, 0))
+            .block(panel("Known commands")),
+        list,
+    );
 }
 
 fn draw_help(f: &mut Frame, app: &App, area: Rect) {
@@ -1426,6 +1538,49 @@ mod tests {
         a.stage_write_block();
         assert!(a.confirm.is_none());
         assert!(a.log.iter().any(|(m, bad)| *bad && m.contains("4 bytes")));
+    }
+
+    #[test]
+    fn picking_an_example_loads_it_into_the_field() {
+        let mut a = app();
+        a.key(KeyCode::Char('4'));
+        assert_eq!(a.console.value, EXAMPLES[0].1, "starts on the first");
+
+        a.key(KeyCode::Down);
+        assert_eq!(a.console.value, EXAMPLES[1].1);
+        assert!(render(&a).contains(EXAMPLES[1].1), "and it is on screen");
+
+        a.key(KeyCode::Up);
+        a.key(KeyCode::Up);
+        assert_eq!(a.example, EXAMPLES.len() - 1, "wraps backwards");
+        assert_eq!(a.console.value, EXAMPLES[EXAMPLES.len() - 1].1);
+    }
+
+    /// Unrecoverable, so the prompt has to name what it is about to destroy
+    #[test]
+    fn the_wipe_confirmation_names_the_tag_it_would_erase() {
+        let mut a = app();
+        a.pad = Pad::Lf {
+            id: [0xde, 0xad, 0xbe, 0xef, 0x01],
+            freq: 125_000,
+        };
+        a.key(KeyCode::Char('x'));
+
+        // Wrapping in a narrow panel can split a phrase, so check the wording
+        // on the prompt and the rendering on a token that cannot straddle
+        let prompt = &a.confirm.as_ref().expect("staged").prompt;
+        assert!(
+            prompt.iter().any(|l| l.contains("de ad be ef 01")),
+            "names what it would erase: {prompt:?}"
+        );
+        assert!(
+            prompt.iter().any(|l| l.contains("config word")),
+            "and says block 0 goes too: {prompt:?}"
+        );
+        assert!(render(&a).contains("de ad be ef 01"), "reaches the screen");
+
+        a.key(KeyCode::Char('n'));
+        assert!(a.confirm.is_none(), "anything but y cancels");
     }
 
     #[test]

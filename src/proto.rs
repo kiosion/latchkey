@@ -133,6 +133,23 @@ pub fn lf_write_block(freq: u32, blk: u8, data: [u8; 4]) -> Vec<u8> {
     p
 }
 
+/// Raw demodulator output, from `0x40a5a0`. Code `41` arms the sampler and `46`
+/// fetches 40 bytes. The route to 125 kHz protocols other than EM4100
+pub fn lf_sample(code: u8, arg: u8) -> Vec<u8> {
+    let mut p = vec![0xff, 0x00, 0x66, 0x00, 0x1e];
+    p.extend_from_slice(&125_000u32.to_le_bytes());
+    p.extend_from_slice(&[code, arg]);
+    p
+}
+
+/// Order a wipe writes in. The config word last, so an interrupted wipe leaves
+/// the tag still emitting
+pub const WIPE_ORDER: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 0];
+
+/// Both answer plain ASCII with no length byte
+pub const MODEL: [u8; 5] = [0xff, 0x00, 0x68, 0x00, 0x00];
+pub const SERIAL: [u8; 5] = [0xff, 0x00, 0x69, 0x00, 0x00];
+
 /// Nine 1 bits, each of the ten nibbles followed by its own even parity bit,
 /// four column parity bits across the nibbles, a 0 stop bit. 9 + 50 + 4 + 1.
 pub fn em4100_frame(id: [u8; 5]) -> u64 {
@@ -244,8 +261,10 @@ pub fn is_trailer(blk: u8) -> bool {
     }
 }
 
-pub fn beep(dur: u8) -> Vec<u8> {
-    vec![0xff, 0x00, 0x40, 0x50, 0x04, 0x01, dur, 0x01, 0x01]
+/// Data is the ACR122U's `<T1> <T2> <repeats> <buzzer link>`, so `repeats`
+/// counts the beeps. `p2` is its LED selector; `0x50` blinks red only.
+pub fn beep(dur: u8, reps: u8) -> Vec<u8> {
+    vec![0xff, 0x00, 0x40, 0x50, 0x04, 0x01, dur, reps, 0x01]
 }
 
 /// The ways an EM4100 ID gets persisted, from the vendor's format strings at
